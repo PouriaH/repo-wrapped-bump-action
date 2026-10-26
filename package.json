@@ -9,7 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test \"test/unit/**/*.test.mjs\"",
+    "test": "node --test test/unit/*.test.mjs",
     "e2e": "node test/e2e.mjs"
   }
 }

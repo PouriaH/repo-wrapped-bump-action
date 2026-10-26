@@ -83,8 +83,9 @@ runs:
       with:
         ref: ${{ inputs.base }}
         fetch-depth: 0
-        # With a pr-token the push — and so the PR — is made as that identity, which is
-        # what lets your normal PR workflows run.
+        # Never leave the token in .git/config: the install and the build run repo code.
+        # The bump step hands it to `git push` and `gh` only, per process.
+        persist-credentials: false
         token: ${{ inputs.pr-token || github.token }}
 
     - name: Detect package manager and Node version

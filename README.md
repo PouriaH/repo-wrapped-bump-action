@@ -18,6 +18,7 @@ on:
       version: { required: true }
       base: { required: false } # defaults to the repo's default branch
       request_id: { required: false } # Repo Wrapped tracking id
+      singletons: { required: false } # the org's must-be-one-copy packages
 permissions:
   contents: write
   pull-requests: write
@@ -32,12 +33,13 @@ jobs:
           version: ${{ inputs.version }}
           base: ${{ inputs.base }}
           request-id: ${{ inputs.request_id }}
+          singletons: ${{ inputs.singletons }}
           # Optional — see "CI on the PR" below
           pr-token: ${{ secrets.REPO_WRAPPED_BUMP_TOKEN }}
           registry-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
-Repo Wrapped notices the file (`.github/workflows/repo-wrapped-bump.yml`) and marks the repo "bump-ready". The workflow **must have that name** — Repo Wrapped dispatches it by file name.
+Repo Wrapped notices the file (`.github/workflows/repo-wrapped-bump.yml`) and marks the repo "bump-ready". The workflow **must have that name** — Repo Wrapped dispatches it by file name. Repo Wrapped passes your org's Package Map singletons as `singletons`; a workflow installed before that input existed still works (Repo Wrapped retries without it), but add the two `singletons` lines to have those duplicates refused too.
 
 Run it yourself:
 
@@ -48,8 +50,8 @@ gh workflow run repo-wrapped-bump.yml -R acme/web -f package=@acme/ui -f version
 ## What it does
 
 1. Checks out `base` (the default branch when empty). Detects the package manager from the lockfile (`pnpm-lock.yaml` → pnpm, `package-lock.json` → npm, `yarn.lock` → yarn, Berry included) and Node from `.nvmrc` / `.node-version` / `engines.node`, else 20.
-2. **Registry auth.** If the package's scope maps to `npm.pkg.github.com` (from your `.npmrc` or a manifest's `publishConfig`), `registry-token` is written to the **runner's** `~/.npmrc` — never to the repository.
-3. **Rewrites specifiers, keeping the range prefix**: `^1.2.0` → `^1.4.0`, `~` stays `~`, an exact pin stays exact, `>=` stays `>=`. Every `package.json` that declares the package, in `dependencies`, `devDependencies`, `peerDependencies` and `optionalDependencies`. `workspace:` / `link:` / `file:` specifiers are in-repo links and are left alone. Formatting is preserved byte for byte. A pin in `overrides` / `resolutions` / `pnpm.overrides` is reported, not changed.
+2. **Registry auth.** If the package's scope maps to `npm.pkg.github.com` (from your `.npmrc` or a manifest's `publishConfig`), `registry-token` is written to the **runner's** `~/.npmrc` for the install only — never to the repository — and removed again (or the file restored) before the build runs.
+3. **Rewrites specifiers, keeping the range prefix**: `^1.2.0` → `^1.4.0`, `~` stays `~`, an exact pin stays exact, `>=` stays `>=`. A bound that would exclude the new version (`<2.0.0`, `<=`, `>`) or a compound range (`>=1 <2`, `^1 || ^2`, `1.0.0 - 2.0.0`) becomes `^<version>`, and the PR says so. Every `package.json` that declares the package, in `dependencies`, `devDependencies`, `peerDependencies` and `optionalDependencies`. `workspace:` / `link:` / `file:` specifiers are in-repo links and are left alone. Formatting is preserved byte for byte. A pin in `overrides` / `resolutions` / `pnpm.overrides` is reported, not changed.
 4. **Installs, refreshing the lockfile** (`pnpm install --no-frozen-lockfile`, `npm install`, `yarn install`) — once per lockfile directory, with the manager that wrote that lockfile.
 5. **Duplicate check.** If the refreshed lockfile resolves the bumped package — or anything in `singletons` — at more than one version, the run fails and lists the versions.
 6. **Verifies.** Runs `verify-command`, or by default `<pm> run build` if the root `package.json` has a `build` script, else `typecheck`, else `test`. If there is none, it says the bump was **not** verified (in the log, the summary and the PR).
@@ -92,7 +94,8 @@ The Packages tab dispatches this workflow with **your own** GitHub token (a fine
 
 ## Guarantees
 
-- The registry token goes to the runner's user `~/.npmrc`, is masked in logs, and is never on a command line or in the repository.
+- The registry token goes to the runner's user `~/.npmrc` for the install only, is masked in logs, and is never on a command line or in the repository.
+- **No write token reaches your repository's code.** The checkout does not persist credentials; the install (dependency lifecycle scripts), the build and the local git commands run with `GH_TOKEN`, `GITHUB_TOKEN`, the action's own `BUMP_*` inputs and the `ACTIONS_*` runtime tokens removed from their environment. The push token is handed only to `git push` (a per-process auth header, `--no-verify`) and to `gh`.
 - Only `package.json` files and lockfiles are staged. Nothing else the install or the build produced is committed.
 - Inputs are validated before use (they arrive from whoever dispatched the workflow): an invalid package name, version or branch stops the run before anything is touched.
 - Re-running with the same package and version updates the same branch and PR.

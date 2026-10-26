@@ -11,6 +11,7 @@
 
 import path from "node:path";
 import { detectPackageManager, pmOfLockfile } from "./detect.mjs";
+import { pushAuthEnv, scrubEnv } from "./env.mjs";
 import { findDuplicates, parseLockfile } from "./lockfile.mjs";
 import { authNpmrcLines, usesGithubPackages } from "./npmrc.mjs";
 import { installDirs, lockfileIn, STAGEABLE_NAMES, walkRepo } from "./plan.mjs";
@@ -122,8 +123,14 @@ export async function run(input, deps) {
     failure: null,
     detail: "",
   };
+  // Every child process starts from an environment with no GitHub credential in it
+  // (install scripts, the build and git hooks are repo code). The token is added back
+  // only for `git push` and `gh`, one process at a time.
+  const childEnv = scrubEnv(deps.env ?? process.env);
+  const withEnv = (extra = {}) => ({ env: { ...childEnv, ...extra }, replaceEnv: true });
   const ghEnv = { GH_TOKEN: deps.ghToken };
-  const git = (args, opts = {}) => deps.exec("git", args, { cwd: root, ...opts });
+  const git = (args, opts = {}) => deps.exec("git", args, { cwd: root, ...opts, ...withEnv(opts.env) });
+  let restoreUserNpmrc = () => {};
   const gitIdentity = ["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com"];
 
   let step = "inspect";
@@ -203,8 +210,20 @@ export async function run(input, deps) {
         log.mask(input.registryToken);
         const userNpmrc = path.join(deps.homedir, ".npmrc");
         const lines = authNpmrcLines(input.pkg, input.registryToken, { npmrcTexts });
+        // Remember what was there, so the token is gone again before the verify command
+        // (the repo's own build) runs — it is needed by the install only.
+        const original = exists(fs, userNpmrc) ? fs.readFileSync(userNpmrc, "utf8") : null;
         fs.appendFileSync(userNpmrc, `${lines.join("\n")}\n`);
-        log.info("Wrote GitHub Packages auth to the runner's user .npmrc (never to the repository).");
+        restoreUserNpmrc = () => {
+          restoreUserNpmrc = () => {};
+          try {
+            if (original === null) fs.rmSync(userNpmrc, { force: true });
+            else fs.writeFileSync(userNpmrc, original);
+          } catch (e) {
+            log.warn(`Could not remove the registry token from the runner's user npm config: ${e?.message ?? e}`);
+          }
+        };
+        log.info("Wrote GitHub Packages auth to the runner's user .npmrc for the install only (never to the repository).");
       }
     }
 
@@ -221,13 +240,16 @@ export async function run(input, deps) {
       log.group(`${icmd} ${iargs.join(" ")}  (${dir || "."})`);
       const res = await deps.exec(icmd, iargs, {
         cwd: path.join(root, dir),
-        env: { CI: "true", YARN_ENABLE_IMMUTABLE_INSTALLS: "false", npm_config_yes: "true" },
+        ...withEnv({ CI: "true", YARN_ENABLE_IMMUTABLE_INSTALLS: "false", npm_config_yes: "true" }),
       });
       log.endGroup();
       if (res.code !== 0) {
+        restoreUserNpmrc();
         throw new StepError(step, `\`${icmd} ${iargs.join(" ")}\` failed in \`${dir || "."}\` (exit ${res.code}).`, tail(res.output));
       }
     }
+    // The registry token served the install; nothing after this (the build) gets it.
+    restoreUserNpmrc();
 
     // ---- duplicate copies ---------------------------------------------------------------
     step = "duplicates";
@@ -250,7 +272,7 @@ export async function run(input, deps) {
     const v = chooseVerifyCommand({ override: input.verifyCommand, scripts: rootPkg.scripts, pm: det.pm });
     if (v.command) {
       log.group(`Verify: ${v.label}`);
-      const res = await deps.exec(v.command, [], { cwd: root, shell: true, env: { CI: "true" } });
+      const res = await deps.exec(v.command, [], { cwd: root, shell: true, ...withEnv({ CI: "true" }) });
       log.endGroup();
       result.verify = { label: v.label, ran: true };
       if (res.code !== 0) throw new StepError(step, `\`${v.label}\` failed (exit ${res.code}).`, tail(res.output));
@@ -273,7 +295,7 @@ export async function run(input, deps) {
     // ---- push + PR -------------------------------------------------------------------------
     step = "push";
     log.group("Push");
-    const push = await git(["push", "--force", "origin", result.branch]);
+    const push = await pushBranch(result.branch);
     log.endGroup();
     if (push.code !== 0) throw new StepError(step, `git push failed (exit ${push.code}).`, tail(push.output));
 
@@ -292,7 +314,7 @@ export async function run(input, deps) {
       try {
         log.group("Open a draft PR for the failed bump");
         result.branch = await commitBranch();
-        const push = await git(["push", "--force", "origin", result.branch]);
+        const push = await pushBranch(result.branch);
         if (push.code !== 0) throw new Error(`git push failed (exit ${push.code})`);
         result.prUrl = await openOrUpdatePr({ draft: true });
         log.info(`Draft PR: ${result.prUrl}`);
@@ -304,10 +326,22 @@ export async function run(input, deps) {
     }
     return result;
   } finally {
+    restoreUserNpmrc();
     writeReport(result, input, deps);
   }
 
   // --- local functions (hoisted) -------------------------------------------------------
+
+  /**
+   * The ONLY git command that gets the token: as a per-process auth header (checkout ran
+   * with persist-credentials: false), with `--no-verify` so no pre-push hook runs while
+   * it is in the environment.
+   */
+  async function pushBranch(branch) {
+    return git(["push", "--no-verify", "--force", "origin", branch], {
+      env: pushAuthEnv(childEnv, deps.ghToken, deps.serverUrl),
+    });
+  }
 
   async function commitBranch() {
     const branch = branchName(input.pkg, input.version);
@@ -340,7 +374,7 @@ export async function run(input, deps) {
     });
     const bodyFile = path.join(deps.tmpdir, `rw-bump-body-${process.pid}.md`);
     fs.writeFileSync(bodyFile, body);
-    const gh = (args) => deps.exec("gh", args, { cwd: root, env: ghEnv, stream: false });
+    const gh = (args) => deps.exec("gh", args, { cwd: root, stream: false, ...withEnv(ghEnv) });
     const label = draft ? LABEL_FAILED : LABEL_BUMP;
 
     // Labels: best effort; a missing label must not fail the bump.

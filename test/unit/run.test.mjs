@@ -72,7 +72,7 @@ function makeDeps(repoDir, { home, tmp }, handlers = {}, extra = {}) {
     },
     async exec(cmd, args = [], opts = {}) {
       const line = [cmd, ...args].join(" ");
-      calls.push({ cmd, args, cwd: opts.cwd, env: opts.env, shell: opts.shell, line });
+      calls.push({ cmd, args, cwd: opts.cwd, env: opts.env, replaceEnv: opts.replaceEnv, shell: opts.shell, line });
       for (const [prefix, fn] of Object.entries(handlers)) {
         if (line.startsWith(prefix)) {
           const r = (await fn({ cmd, args, opts, line })) ?? {};
@@ -132,7 +132,7 @@ describe("run — the happy path", () => {
     const commit = calls.find((c) => c.line.includes("commit -m"));
     assert.equal(commit.args.at(-1), "chore(deps): bump @acme/ui to 1.4.0");
     assert.ok(commit.args.includes("user.name=github-actions[bot]"));
-    assert.deepEqual(calls.find((c) => c.line.startsWith("git push")).args, ["push", "--force", "origin", "repo-wrapped/bump-acme-ui-1.4.0"]);
+    assert.deepEqual(calls.find((c) => c.line.startsWith("git push")).args, ["push", "--no-verify", "--force", "origin", "repo-wrapped/bump-acme-ui-1.4.0"]);
 
     // verification ran as a shell command, in CI mode, after the install
     const verify = calls.find((c) => c.line === "npm run build");
@@ -381,9 +381,22 @@ describe("run — registry auth", () => {
 
   it("writes the token to the runner's user .npmrc, masks it, and never touches the repo's .npmrc", async () => {
     const r = makeRepo(files(scoped));
-    const { deps, logs, calls } = makeDeps(r.repo, r, healthy(r.repo));
+    let duringInstall = null;
+    let duringVerify = "unread";
+    const { deps, logs, calls } = makeDeps(r.repo, r, healthy(r.repo, {
+      "npm install": () => {
+        duringInstall = fs.readFileSync(path.join(r.home, ".npmrc"), "utf8");
+        fs.writeFileSync(path.join(r.repo, "package-lock.json"), lockV3({ "@acme/ui": "1.4.0" }));
+      },
+      "npm run build": () => {
+        duringVerify = fs.existsSync(path.join(r.home, ".npmrc"));
+      },
+    }));
     await run(baseInput({ workingDirectory: r.repo, registryToken: "ghs_secret" }), deps);
-    assert.equal(fs.readFileSync(path.join(r.home, ".npmrc"), "utf8"), "//npm.pkg.github.com/:_authToken=ghs_secret\n");
+    assert.equal(duringInstall, "//npm.pkg.github.com/:_authToken=ghs_secret\n");
+    // gone again before the build runs (B6), and after the run
+    assert.equal(duringVerify, false);
+    assert.equal(fs.existsSync(path.join(r.home, ".npmrc")), false);
     assert.equal(fs.readFileSync(path.join(r.repo, ".npmrc"), "utf8"), scoped[".npmrc"]);
     assert.deepEqual(logs.masked, ["ghs_secret"]);
     // the token is not on any command line, and the repo's .npmrc is not staged
@@ -401,9 +414,24 @@ describe("run — registry auth", () => {
 
   it("maps the scope itself when only publishConfig says it is on GitHub Packages", async () => {
     const r = makeRepo(files({ "libs/x/package.json": { name: "@acme/x", version: "1.0.0", publishConfig: { registry: "https://npm.pkg.github.com" } } }));
-    const { deps } = makeDeps(r.repo, r, healthy(r.repo));
+    let seen = null;
+    const { deps } = makeDeps(r.repo, r, healthy(r.repo, {
+      "npm install": () => {
+        seen = fs.readFileSync(path.join(r.home, ".npmrc"), "utf8");
+        fs.writeFileSync(path.join(r.repo, "package-lock.json"), lockV3({ "@acme/ui": "1.4.0" }));
+      },
+    }));
     await run(baseInput({ workingDirectory: r.repo, registryToken: "ghs_secret" }), deps);
-    assert.deepEqual(fs.readFileSync(path.join(r.home, ".npmrc"), "utf8").trim().split("\n"), ["//npm.pkg.github.com/:_authToken=ghs_secret", "@acme:registry=https://npm.pkg.github.com"]);
+    assert.deepEqual(seen.trim().split("\n"), ["//npm.pkg.github.com/:_authToken=ghs_secret", "@acme:registry=https://npm.pkg.github.com"]);
+  });
+
+  it("restores a user npm config that was already there, even when the install fails (B6)", async () => {
+    const r = makeRepo(files(scoped));
+    fs.writeFileSync(path.join(r.home, ".npmrc"), "fund=false\n");
+    const { deps } = makeDeps(r.repo, r, healthy(r.repo, { "npm install": () => ({ code: 1, output: "E401" }) }));
+    const res = await run(baseInput({ workingDirectory: r.repo, registryToken: "ghs_secret" }), deps);
+    assert.equal(res.failure.step, "install");
+    assert.equal(fs.readFileSync(path.join(r.home, ".npmrc"), "utf8"), "fund=false\n");
   });
 });
 
@@ -449,5 +477,61 @@ describe("helpers", () => {
     const md = summaryMarkdown({ status: "failed", detail: "", failure: { step: "verify", message: "boom", tail: "x" }, changes: [], notes: [], skipped: [], verify: { ran: false, label: "(none)" }, prUrl: null }, { pkg: "a", version: "1.0.0" });
     assert.match(md, /❌ \*\*failed\*\*/);
     assert.match(md, /Failed at \*\*verify\*\*/);
+  });
+});
+
+describe("run — no write token reaches repo code (B6)", () => {
+  const secretEnv = {
+    PATH: "/usr/bin",
+    HOME: "/home/runner",
+    GITHUB_WORKSPACE: "/w",
+    GH_TOKEN: "ghp_push",
+    GITHUB_TOKEN: "ghs_job",
+    BUMP_PR_TOKEN: "ghp_push",
+    BUMP_REGISTRY_TOKEN: "ghs_pkg",
+    ACTIONS_RUNTIME_TOKEN: "rt",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "oidc",
+    ACTIONS_ID_TOKEN_REQUEST_URL: "https://x",
+    NODE_AUTH_TOKEN: "user-npm",
+  };
+  const leaks = (env) =>
+    Object.entries(env ?? {}).filter(
+      ([k, v]) => /^(GH_TOKEN|GITHUB_TOKEN|BUMP_|ACTIONS_)/i.test(k) || ["ghp_push", "ghs_job", "ghs_pkg", "rt", "oidc"].includes(v),
+    );
+
+  it("install, verify and every git command but push run with a scrubbed environment", async () => {
+    const r = makeRepo(files());
+    const { deps, calls } = makeDeps(r.repo, r, healthy(r.repo), { env: secretEnv, ghToken: "ghp_push" });
+    const res = await run(baseInput({ workingDirectory: r.repo }), deps);
+    assert.equal(res.status, "bumped");
+    for (const c of calls) {
+      if (c.line.startsWith("git push") || c.line.startsWith("gh ")) continue;
+      assert.deepEqual(leaks(c.env), [], c.line);
+      // the child gets exactly this environment, not process.env layered under it
+      assert.equal(c.replaceEnv, true, c.line);
+    }
+    const install = calls.find((c) => c.line.startsWith("npm install"));
+    assert.equal(install.env.PATH, "/usr/bin");
+    assert.equal(install.env.NODE_AUTH_TOKEN, "user-npm"); // a user's own registry auth is kept
+    assert.equal(install.env.CI, "true");
+    const verify = calls.find((c) => c.line === "npm run build");
+    assert.deepEqual(leaks(verify.env), []);
+  });
+
+  it("git push alone gets the token, as a per-process auth header, with hooks skipped", async () => {
+    const r = makeRepo(files());
+    const { deps, calls } = makeDeps(r.repo, r, healthy(r.repo), { env: secretEnv, ghToken: "ghp_push", serverUrl: "https://github.com" });
+    await run(baseInput({ workingDirectory: r.repo }), deps);
+    const push = calls.find((c) => c.line.startsWith("git push"));
+    assert.ok(push.args.includes("--no-verify"));
+    assert.equal(push.line.includes("ghp_push"), false, "never on the command line");
+    assert.equal(push.env.GIT_CONFIG_COUNT, "1");
+    assert.equal(push.env.GIT_CONFIG_KEY_0, "http.https://github.com/.extraheader");
+    assert.equal(push.env.GIT_CONFIG_VALUE_0, `AUTHORIZATION: basic ${Buffer.from("x-access-token:ghp_push").toString("base64")}`);
+    assert.equal(push.env.GH_TOKEN, undefined);
+    const gh = calls.find((c) => c.line.startsWith("gh pr create"));
+    assert.equal(gh.env.GH_TOKEN, "ghp_push");
+    assert.equal(gh.env.BUMP_REGISTRY_TOKEN, undefined);
+    assert.equal(gh.env.ACTIONS_RUNTIME_TOKEN, undefined);
   });
 });

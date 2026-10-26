@@ -92,7 +92,11 @@ async function main() {
     tmpdir: env.RUNNER_TEMP || os.tmpdir(),
     summaryFile: env.GITHUB_STEP_SUMMARY,
     outputFile: env.GITHUB_OUTPUT,
+    // The push/PR token. It reaches `git push` and `gh` only; every other child process
+    // gets `env` with it (and every other credential) removed — see env.mjs.
     ghToken: env.GH_TOKEN,
+    serverUrl: env.GITHUB_SERVER_URL || "https://github.com",
+    env,
   });
   process.exitCode = result.status === "failed" ? 1 : 0;
 }

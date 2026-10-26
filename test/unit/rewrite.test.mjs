@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { bumpRange, isLocalSpecifier, rewriteManifest } from "../../src/rewrite.mjs";
+import { bumpChangesForm, bumpRange, isLocalSpecifier, rewriteManifest } from "../../src/rewrite.mjs";
 
 describe("bumpRange — the range prefix survives", () => {
   const table = [
@@ -9,7 +9,6 @@ describe("bumpRange — the range prefix survives", () => {
     ["1.2.0", "1.4.0", "1.4.0"],
     ["=1.2.0", "1.4.0", "=1.4.0"],
     [">=1.2.0", "2.0.0", ">=2.0.0"],
-    ["<=1.2.0", "1.4.0", "<=1.4.0"],
     ["^1.2.0-beta.1", "1.4.0", "^1.4.0"],
     ["v1.2.0", "1.4.0", "1.4.0"],
     ["^1.2.0", "2.0.0-rc.1", "^2.0.0-rc.1"],
@@ -19,11 +18,43 @@ describe("bumpRange — the range prefix survives", () => {
     it(`${range} + ${version} = ${expected}`, () => assert.equal(bumpRange(range, version), expected));
   }
   it("leaves what it cannot rewrite safely alone", () => {
-    for (const r of ["workspace:*", "workspace:^", "link:../x", "file:../x", "portal:../x", "npm:other@^1", "latest", "*", "^1 || ^2", ">=1 <2", "1.x", "github:a/b", "^1.2", ""]) {
+    for (const r of ["workspace:*", "workspace:^", "link:../x", "file:../x", "portal:../x", "npm:other@^1", "latest", "*", "1.x", "^1", "github:a/b", "^1.2", ""]) {
       assert.equal(bumpRange(r, "1.4.0"), null, JSON.stringify(r));
     }
     assert.equal(bumpRange("^1.0.0", "1.4"), null);
     assert.equal(bumpRange("^1.0.0", "latest"), null);
+  });
+  it("bounds and compound ranges become a caret instead of excluding the target", () => {
+    const table = [
+      ["<2.0.0", "2.1.0", "^2.1.0"],
+      [">1.0.0", "1.4.0", "^1.4.0"],
+      ["<=1.2.0", "1.4.0", "^1.4.0"],
+      ["<2", "2.1.0", "^2.1.0"],
+      [">=1 <2", "1.4.0", "^1.4.0"],
+      ["^1 || ^2", "2.1.0", "^2.1.0"],
+      ["1.0.0 - 2.0.0", "2.1.0", "^2.1.0"],
+      [">= 1.2.0", "2.0.0", ">=2.0.0"],
+    ];
+    for (const [range, version, expected] of table) assert.equal(bumpRange(range, version), expected, range);
+    assert.equal(bumpChangesForm("<2.0.0", "^2.1.0"), true);
+    assert.equal(bumpChangesForm("^1.2.0", "^1.4.0"), false);
+    assert.equal(bumpChangesForm("1.2.0", "1.4.0"), false);
+  });
+  it("the same table as the app's bumpRange (src/lib/org/package-map.ts)", () => {
+    // Kept identical — the app previews exactly what this rewrites.
+    for (const [range, version, expected] of [
+      ["^1.2.0", "1.4.0", "^1.4.0"],
+      ["~1.2.0", "1.4.0", "~1.4.0"],
+      ["1.2.0", "1.4.0", "1.4.0"],
+      ["=1.2.0", "1.4.0", "=1.4.0"],
+      [">=1.2.0", "2.0.0", ">=2.0.0"],
+      ["<2.0.0", "2.1.0", "^2.1.0"],
+      ["^1 || ^2", "2.1.0", "^2.1.0"],
+      ["1.x", "1.4.0", null],
+      ["npm:@acme/ui@^1.0.0", "1.4.0", null],
+    ]) {
+      assert.equal(bumpRange(range, version), expected, range);
+    }
   });
   it("isLocalSpecifier", () => {
     assert.equal(isLocalSpecifier("workspace:*"), true);
@@ -157,5 +188,26 @@ describe("rewriteManifest", () => {
     const r = rewriteManifest(text, "@acme/ui", "1.4.0");
     assert.equal(JSON.parse(r.text).dependencies["@acme/ui"], "^1.4.0");
     assert.equal(JSON.parse(r.text).description, 'say "hi" {');
+  });
+});
+
+describe("rewriteManifest — a change of form is called out (B6)", () => {
+  it("notes when a bound had to become a caret", () => {
+    const text = `{
+  "name": "app",
+  "dependencies": { "@acme/ui": "<2.0.0" }
+}
+`;
+    const res = rewriteManifest(text, "@acme/ui", "2.1.0");
+    assert.deepEqual(res.changes, [{ block: "dependencies", from: "<2.0.0", to: "^2.1.0" }]);
+    assert.equal(JSON.parse(res.text).dependencies["@acme/ui"], "^2.1.0");
+    assert.ok(res.notes.some((n) => /"<2\.0\.0".*cannot keep its form.*"\^2\.1\.0"/.test(n)), res.notes.join("; "));
+  });
+  it("says nothing when the form is kept", () => {
+    const text = `{
+  "dependencies": { "@acme/ui": "~1.2.0" }
+}
+`;
+    assert.deepEqual(rewriteManifest(text, "@acme/ui", "1.4.0").notes, []);
   });
 });

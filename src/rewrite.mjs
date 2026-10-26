@@ -12,22 +12,44 @@ export const isLocalSpecifier = (range) => LOCAL.test(String(range).trim());
 
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
+/** One comparator: an operator, then a full or partial (`1`, `1.x`) version. */
+const COMPARATOR =
+  /^(\^|~|>=|<=|>|<|=)?v?(\d+(?:\.(?:\d+|[xX*])){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/;
+
 /**
- * `range` rewritten to `version`, prefix preserved; null when it cannot be bumped
- * safely (workspace/link/file/npm: specifiers, tags like `latest`, `*`, `1.x`, ranges
- * with `||`, spaces or hyphens, git URLs).
+ * `range` rewritten to `version`. A caret, a tilde, `>=` and an exact pin keep their
+ * form (`^1.2.0` -> `^1.4.0`, `1.2.0` stays exact). A strict or upper bound (`<`, `<=`,
+ * `>`) and a compound range (`>=1 <2`, `^1 || ^2`, `1.0.0 - 2.0.0`) cannot keep their
+ * form without excluding the target — `<2.0.0` bumped to 2.1.0 would become `<2.1.0` —
+ * so they become `^<version>` (`bumpChangesForm` tells the PR). null for specifiers left
+ * alone: workspace/link/file/npm:, dist-tags like `latest`, `*`, a lone partial version
+ * (`1.x`, `^1`), git URLs.
  */
 export function bumpRange(range, version) {
   const trimmed = String(range).trim();
   if (isLocalSpecifier(trimmed)) return null;
   if (!SEMVER.test(version)) return null;
-  const m =
-    /^(\^|~|>=|<=|>|<|=)?\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/.exec(
-      trimmed,
-    );
-  if (!m) return null;
-  return `${m[1] ?? ""}${version}`;
+  const tokens = trimmed
+    .replace(/(\^|~|>=|<=|>|<|=)\s+/g, "$1")
+    .replace(/\|\|/g, " || ")
+    .split(/\s+/)
+    .filter(Boolean);
+  if (tokens.length === 0) return null;
+  if (tokens.length === 1) {
+    const m = COMPARATOR.exec(tokens[0]);
+    if (!m) return null;
+    const op = m[1] ?? "";
+    if (op === "<" || op === "<=" || op === ">") return `^${version}`;
+    if (!SEMVER.test(m[2])) return null;
+    return `${op}${version}`;
+  }
+  if (!tokens.every((t) => t === "||" || t === "-" || COMPARATOR.test(t))) return null;
+  return `^${version}`;
 }
+
+/** Did `bumpRange` have to change the range's form (to a caret) rather than keep it? */
+export const bumpChangesForm = (range, next) =>
+  String(next).startsWith("^") && !String(range).trim().startsWith("^");
 
 export const DEP_BLOCKS = [
   "dependencies",
@@ -133,6 +155,9 @@ export function rewriteManifest(text, name, version) {
     const replaced = body.replace(re, (_m, a, _old, c) => `${a}${next}${c}`);
     out = out.slice(0, span.start) + replaced + out.slice(span.end);
     changes.push({ block, from: declared, to: next });
+    if (bumpChangesForm(declared, next)) {
+      notes.push(`${block} declared "${declared}", which cannot keep its form without excluding ${version}; rewritten to "${next}"`);
+    }
   }
 
   // The rewrite must leave valid JSON that says what we meant.

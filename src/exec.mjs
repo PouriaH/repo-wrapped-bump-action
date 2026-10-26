@@ -16,14 +16,17 @@ export const needsShell = (cmd) => process.platform === "win32" && WINDOWS_SHIMS
 /**
  * @param {string} cmd
  * @param {string[]} args
- * @param {{ cwd?: string, env?: Record<string,string|undefined>, shell?: boolean, stream?: boolean }} [opts]
+ * `replaceEnv: true` makes `env` the child's WHOLE environment (the run passes a
+ * credential-scrubbed one); otherwise `env` is layered over `process.env`.
+ *
+ * @param {{ cwd?: string, env?: Record<string,string|undefined>, replaceEnv?: boolean, shell?: boolean, stream?: boolean }} [opts]
  * @returns {Promise<{ code: number, stdout: string, stderr: string, output: string }>}
  */
 export function execReal(cmd, args = [], opts = {}) {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
-      env: { ...process.env, ...opts.env },
+      env: opts.replaceEnv ? { ...opts.env } : { ...process.env, ...opts.env },
       shell: opts.shell ?? needsShell(cmd),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,

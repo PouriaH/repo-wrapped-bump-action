@@ -399,9 +399,32 @@ export async function run(input, deps) {
       return existing.url;
     }
     const create = await gh(["pr", "create", "--base", baseBranch, "--head", branch, "--title", title, "--body-file", bodyFile, "--label", label, ...(draft ? ["--draft"] : [])]);
-    if (create.code !== 0) throw new StepError("pull-request", `gh pr create failed (exit ${create.code}).`, tail(create.output));
+    if (create.code !== 0) throw new StepError("pull-request", prCreateFailure(create.code, create.output), tail(create.output));
     return create.stdout.trim().split(/\s+/).find((t) => /^https?:\/\//.test(t)) ?? create.stdout.trim();
   }
+}
+
+/**
+ * The error message for a failed `gh pr create`. gh's own reason goes in the message (it
+ * otherwise only reached the job summary), and the commonest cause gets the fix: new
+ * repositories don't let the workflow's GITHUB_TOKEN open pull requests at all.
+ */
+export function prCreateFailure(code, output) {
+  const text = String(output ?? "");
+  if (/not permitted to create or approve pull requests/i.test(text)) {
+    return (
+      "GitHub Actions is not allowed to open pull requests in this repository. The branch was pushed. " +
+      "Fix it once: Settings → Actions → General → Workflow permissions → tick " +
+      '"Allow GitHub Actions to create and approve pull requests" — or pass a `pr-token` ' +
+      "(a fine-grained PAT or GitHub App token with Contents and Pull requests: write)."
+    );
+  }
+  const reason = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .pop();
+  return `gh pr create failed (exit ${code})${reason ? `: ${reason}` : "."}`;
 }
 
 // --- reporting ------------------------------------------------------------------------------

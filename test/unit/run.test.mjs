@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { parseMarker } from "../../src/pr.mjs";
-import { porcelainPaths, run, summaryMarkdown, validateInputs } from "../../src/run.mjs";
+import { porcelainPaths, prCreateFailure, run, summaryMarkdown, validateInputs } from "../../src/run.mjs";
 
 const cleanups = [];
 afterEach(() => {
@@ -533,5 +533,18 @@ describe("run — no write token reaches repo code (B6)", () => {
     assert.equal(gh.env.GH_TOKEN, "ghp_push");
     assert.equal(gh.env.BUMP_REGISTRY_TOKEN, undefined);
     assert.equal(gh.env.ACTIONS_RUNTIME_TOKEN, undefined);
+  });
+});
+
+describe("prCreateFailure", () => {
+  it("names the repository setting when Actions may not open pull requests", () => {
+    const msg = prCreateFailure(1, "pull request create failed: GraphQL: GitHub Actions is not permitted to create or approve pull requests (createPullRequest)\n");
+    assert.match(msg, /Allow GitHub Actions to create and approve pull requests/);
+    assert.match(msg, /pr-token/);
+    assert.match(msg, /branch was pushed/);
+  });
+  it("otherwise carries gh's last error line", () => {
+    assert.equal(prCreateFailure(1, "warn\nGraphQL: Base branch was modified\n"), "gh pr create failed (exit 1): GraphQL: Base branch was modified");
+    assert.equal(prCreateFailure(4, ""), "gh pr create failed (exit 4).");
   });
 });

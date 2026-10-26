@@ -39,6 +39,8 @@ jobs:
           registry-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+**Then allow it to open pull requests.** New repositories don't let a workflow's `GITHUB_TOKEN` create PRs: in the repository (or organization) go to **Settings → Actions → General → Workflow permissions** and tick **Allow GitHub Actions to create and approve pull requests** — or pass a `pr-token` (see [CI on the PR](#ci-on-the-pr--read-this)). Without either, the branch is pushed but the PR step fails and says so.
+
 Repo Wrapped notices the file (`.github/workflows/repo-wrapped-bump.yml`) and marks the repo "bump-ready". The workflow **must have that name** — Repo Wrapped dispatches it by file name. Repo Wrapped passes your org's Package Map singletons as `singletons`; a workflow installed before that input existed still works (Repo Wrapped retries without it), but add the two `singletons` lines to have those duplicates refused too.
 
 Run it yourself:

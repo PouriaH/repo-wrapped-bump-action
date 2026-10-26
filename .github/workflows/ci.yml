@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm test
+
+  # The same flow the action runs, against real package managers and the real registry
+  # (everything except the push and the PR).
+  e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [npm, pnpm, yarn, npm-duplicate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: corepack enable
+      - run: node test/e2e.mjs ${{ matrix.fixture }}
+
+  # The composite action itself (`uses: ./`), in dry-run mode so nothing is pushed.
+  action:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [npm, pnpm, yarn]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare a fixture repository
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/fixture-repo"
+          mkdir -p "$repo"
+          cp -r "test/fixtures/${{ matrix.fixture }}/." "$repo/"
+          cd "$repo"
+          git init -q -b main
+          git add -A
+          git -c user.name=fixture -c user.email=fixture@example.com commit -q -m fixture
+
+      - name: Run the action (dry run)
+        id: bump
+        uses: ./
+        with:
+          package: is-odd
+          version: 3.0.0
+          request-id: ci-${{ matrix.fixture }}
+          dry-run: "true"
+          skip-checkout: "true"
+          working-directory: ${{ runner.temp }}/fixture-repo
+
+      - name: Check the result
+        run: |
+          set -euo pipefail
+          test "${{ steps.bump.outputs.status }}" = "dry-run"
+          test "${{ steps.bump.outputs.branch }}" = "repo-wrapped/bump-is-odd-3.0.0"
+          test "${{ steps.bump.outputs.changed-files }}" = "package.json"
+          cd "$RUNNER_TEMP/fixture-repo"
+          test "$(git log -1 --format=%s)" = "chore(deps): bump is-odd to 3.0.0"
+          grep -q '"is-odd": "^3.0.0"' package.json
+          git status --porcelain
+
+  # A refreshed lockfile that carries two copies of a singleton must FAIL the job.
+  action-duplicates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare a fixture repository
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/fixture-repo"
+          mkdir -p "$repo"
+          cp -r test/fixtures/npm-duplicate/. "$repo/"
+          cd "$repo"
+          git init -q -b main
+          git add -A
+          git -c user.name=fixture -c user.email=fixture@example.com commit -q -m fixture
+
+      - name: Run the action (expected to fail)
+        id: bump
+        continue-on-error: true
+        uses: ./
+        with:
+          package: is-odd
+          version: 3.0.0
+          singletons: is-number
+          dry-run: "true"
+          skip-checkout: "true"
+          working-directory: ${{ runner.temp }}/fixture-repo
+
+      - name: It failed, and said why
+        run: |
+          set -euo pipefail
+          test "${{ steps.bump.outcome }}" = "failure"
+          test "${{ steps.bump.outputs.status }}" = "failed"

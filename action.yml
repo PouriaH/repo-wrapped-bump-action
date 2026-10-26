@@ -1,0 +1,126 @@
+# Repo Wrapped Bump — composite action (contract pinned in the main repo's
+# docs/decisions/039-package-map-and-bumps.md; keep the two in sync).
+#
+# Runs INSIDE the consumer repository, with that repository's own token: it rewrites
+# one internal package's version in every manifest that declares it, refreshes the
+# lockfile, refuses duplicate copies, runs the repo's own BUILD, and opens (or updates)
+# a PR. Repo Wrapped itself only DISPATCHES this workflow, with the signed-in user's
+# own GitHub token — it holds no write access to anything.
+name: "Repo Wrapped Bump"
+description: "Bump one internal package across a repo, build-verified, as a PR — dispatched from Repo Wrapped's Package Map"
+branding:
+  icon: "arrow-up-circle"
+  color: "purple"
+
+inputs:
+  package:
+    description: "The package to bump, e.g. @acme/ui"
+    required: true
+  version:
+    description: "The version to bump it to, e.g. 1.4.0"
+    required: true
+  base:
+    description: "Branch to bump against. Defaults to the repository's default branch."
+    required: false
+    default: ""
+  request-id:
+    description: "Repo Wrapped tracking id; embedded in the PR body so the request can be followed."
+    required: false
+    default: ""
+  verify-command:
+    description: "Command that proves the bump builds. Default: `<pm> run build`, else typecheck, else test."
+    required: false
+    default: ""
+  singletons:
+    description: "Extra packages (space or comma separated) that must resolve to ONE version in the refreshed lockfile. The bumped package is always checked."
+    required: false
+    default: ""
+  open-pr-on-failure:
+    description: "Open a DRAFT PR labelled repo-wrapped:bump-failed when the bump does not pass."
+    required: false
+    default: "false"
+  pr-token:
+    description: "Optional fine-grained PAT or GitHub App token (contents + pull-requests write). PRs opened with it trigger your normal CI; PRs opened with GITHUB_TOKEN do not."
+    required: false
+    default: ""
+  registry-token:
+    description: "Token for GitHub Packages (npm.pkg.github.com) when the package lives there — usually secrets.GITHUB_TOKEN with packages: read."
+    required: false
+    default: ""
+  dry-run:
+    description: "Do everything except push and open the PR (used by this action's own CI)."
+    required: false
+    default: "false"
+  working-directory:
+    description: "Repository root, relative to the workspace."
+    required: false
+    default: "."
+  skip-checkout:
+    description: "Use the repository already checked out in the workspace (this action's own CI)."
+    required: false
+    default: "false"
+
+outputs:
+  status:
+    description: "bumped | dry-run | nothing-to-do | failed"
+    value: ${{ steps.bump.outputs.status }}
+  branch:
+    description: "The branch the bump was committed to."
+    value: ${{ steps.bump.outputs.branch }}
+  pr-url:
+    description: "The pull request, when one was opened or updated."
+    value: ${{ steps.bump.outputs.pr-url }}
+  changed-files:
+    description: "Comma-separated manifests that were rewritten."
+    value: ${{ steps.bump.outputs.changed-files }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check out the base branch
+      if: ${{ inputs.skip-checkout != 'true' }}
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.base }}
+        fetch-depth: 0
+        # With a pr-token the push — and so the PR — is made as that identity, which is
+        # what lets your normal PR workflows run.
+        token: ${{ inputs.pr-token || github.token }}
+
+    - name: Detect package manager and Node version
+      id: detect
+      shell: bash
+      env:
+        BUMP_WORKDIR: ${{ inputs.working-directory }}
+      run: node "$GITHUB_ACTION_PATH/src/cli.mjs" detect
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.detect.outputs.node-version }}
+
+    - name: Enable the package manager
+      shell: bash
+      env:
+        PM: ${{ steps.detect.outputs.pm }}
+      run: |
+        set -euo pipefail
+        if [ "$PM" = "pnpm" ] || [ "$PM" = "yarn" ]; then corepack enable; fi
+
+    - name: Bump
+      id: bump
+      shell: bash
+      env:
+        BUMP_PACKAGE: ${{ inputs.package }}
+        BUMP_VERSION: ${{ inputs.version }}
+        BUMP_BASE: ${{ inputs.base }}
+        BUMP_REQUEST_ID: ${{ inputs.request-id }}
+        BUMP_VERIFY_COMMAND: ${{ inputs.verify-command }}
+        BUMP_SINGLETONS: ${{ inputs.singletons }}
+        BUMP_OPEN_PR_ON_FAILURE: ${{ inputs.open-pr-on-failure }}
+        BUMP_PR_TOKEN: ${{ inputs.pr-token }}
+        BUMP_REGISTRY_TOKEN: ${{ inputs.registry-token }}
+        BUMP_DRY_RUN: ${{ inputs.dry-run }}
+        BUMP_WORKDIR: ${{ inputs.working-directory }}
+        GH_TOKEN: ${{ inputs.pr-token || github.token }}
+      run: node "$GITHUB_ACTION_PATH/src/cli.mjs" run
